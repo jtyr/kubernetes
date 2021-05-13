@@ -32,6 +32,7 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/net/proxy"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -163,6 +164,18 @@ func (s *SpdyRoundTripper) dial(req *http.Request) (net.Conn, error) {
 		return s.dialWithoutProxy(req.Context(), req.URL)
 	}
 
+	switch proxyURL.Scheme {
+	case "socks5":
+		return s.dialWithSocks5Proxy(req, proxyURL)
+	case "https", "http":
+		return s.dialWithHttpProxy(req, proxyURL)
+	}
+
+	return nil, fmt.Errorf("proxy URL scheme not supported: %s", proxyURL.Scheme)
+}
+
+// dialWithHttpProxy dials the host specified by url through an http or an https proxy.
+func (s *SpdyRoundTripper) dialWithHttpProxy(req *http.Request, proxyURL *url.URL) (net.Conn, error) {
 	// ensure we use a canonical host with proxyReq
 	targetHost := netutil.CanonicalAddr(req.URL)
 
@@ -191,6 +204,32 @@ func (s *SpdyRoundTripper) dial(req *http.Request) (net.Conn, error) {
 
 	rwc, _ := proxyClientConn.Hijack()
 
+	return s.tlsConn(req, rwc, targetHost)
+}
+
+// dialWithSocks5Proxy dials the host specified by url through a socks5 proxy.
+func (s *SpdyRoundTripper) dialWithSocks5Proxy(req *http.Request, proxyURL *url.URL) (net.Conn, error) {
+	// ensure we use a canonical host with proxyReq
+	targetHost := netutil.CanonicalAddr(req.URL)
+
+	proxyDialAddr := netutil.CanonicalAddr(proxyURL)
+	proxyDialer, err := proxy.SOCKS5("tcp", proxyDialAddr, nil, proxy.Direct)
+
+	proxyConn, err := proxyDialer.Dial("tcp", targetHost)
+
+	if err != nil {
+		return nil, err
+	}
+
+	proxyClientConn := httputil.NewProxyClientConn(proxyConn, nil)
+
+	rwc, _ := proxyClientConn.Hijack()
+
+	return s.tlsConn(req, rwc, targetHost)
+}
+
+// tlsConn returns a TLS client side connection using rwc as the underlying transport.
+func (s *SpdyRoundTripper) tlsConn(req *http.Request, rwc net.Conn, targetHost string) (net.Conn, error) {
 	if req.URL.Scheme != "https" {
 		return rwc, nil
 	}
